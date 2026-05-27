@@ -4,6 +4,7 @@
 
 | 版本 | 日期 | 作者 | 变更说明 |
 |------|------|------|----------|
+| V2.1 | 2026-05-27 | 架构师 | 消息采集方案升级：UIA 无障碍树直接读取为主方案，剪贴板 Ctrl+A/Ctrl+C 为回退。解决 QQ NT Electron+D3D 渲染下键盘快捷键无法可靠定向到消息列表的问题 |
 | V2.0 | 2026-05-27 | 架构师 | 基于V1.0优化：合并目标流程、改进增量采集方式、增加去重冷却、明确部署约束 |
 
 ---
@@ -23,7 +24,7 @@
   （一条消息匹配多个型号时，型号用顿号分隔合并为一条通知）
 
 #### 1.3 实现原则
-- 不涉及QQ协议破解或内存注入，全程采用**模拟人工操作**（鼠标点击、键盘快捷键、剪贴板复制、窗口切换）。
+- 不涉及QQ协议破解或内存注入，采用**UIA无障碍树直接读取** + **模拟人工操作**相结合的方式：消息采集优先通过 Windows UIA (UI Automation) 无障碍接口直接读取 QQ NT 消息列表的文本内容，仅在 UIA 元素不可用时回退到键盘快捷键+剪贴板复制的方式。消息发送仍使用模拟输入。
 - 程序本身不存储QQ账号密码，不执行登录操作。QQ客户端可通过自身"记住密码"功能在重启后自动登录。
 - 程序部署在可能运行多个其他程序的Windows服务器上，需通过窗口标题精准定位群窗口和联系人窗口。
 
@@ -64,8 +65,14 @@
 - 型号列表无需热加载，更新CSV后重启程序生效。
 
 #### 3.4 消息采集与增量判断（优化版）
-- 对每个激活的群窗口，模拟 **`End`键滚动到底部**（确保最新消息可见），然后 **`Ctrl+A` + `Ctrl+C`** 复制当前聊天区域的全部文本。
-- 解析剪贴板文本，提取每条消息的**发送者、时间、内容**。
+- **主要方案（UIA 直接读取）**：通过 Windows UIA 无障碍接口直接定位 QQ NT 聊天窗口中的 `Window "消息列表"` 元素，遍历其子节点树（`ml-root` Group），提取每条消息的发送者（Group 名称）、时间戳（`上午/下午/昨天 HH:MM` 格式的 Text 子节点）、正文内容。此方案无需焦点切换、键盘模拟或剪贴板操作，不受 Electron webview 焦点机制的限制。
+- **回退方案（剪贴板复制）**：当 UIA 元素不可用时（如 QQ 版本升级改变了 UIA 树结构），回退到模拟 `End` 键滚动到底部（确保最新消息可见），然后 `Ctrl+A` + `Ctrl+C` 复制当前聊天区域的全部文本。
+- **QQ NT UIA 消息树结构**：聊天窗口 → `Window "消息列表"` → `Group "ml-root"` → 子节点序列：
+  - `Text "YYYY/MM/DD HH:MM"` — 日期分隔线
+  - `Group "发送者名称"` — 新消息开始（Group 自身名称为发送者）
+  - `Group → Text "消息正文"` — 消息内容（空名称 Group + Text 子节点）
+  - `Group → Text "上午/下午/昨天 HH:MM"` — 时间戳（标记消息结束）
+- 解析剪贴板文本（回退方案时），提取每条消息的**发送者、时间、内容**。
 - **消息过滤**：忽略系统消息（如加群/退群/好友提示等无发送者的系统通知）、非文本消息（如图片、文件、贴纸、语音等仅显示 `[图片]`/`[文件]`/`[动画表情]` 占位符的无文本内容消息）。仅对包含文本内容的消息做后续处理。
 - **增量判断**：记录每个群**上一次成功采集的消息指纹**（指纹 = 发送者 + 完整时间戳(含日期) + 内容前100字符的MD5）。本次采集的消息与上次指纹集合比较，**仅处理新增消息**，避免重复通知。
 - 程序重启后，指纹缓存清空，会重新处理当前窗口显示的所有消息（可接受，因为重启频率低）。
@@ -225,47 +232,75 @@ def activate_window(hwnd):
 
 #### 3.2 QQ自动化操作 (`qq_automation.py`)
 
-使用 `pywinauto` 连接到QQ进程，通过控件ID定位。
+使用 `pywinauto` 连接到QQ进程，主要操作通过 UIA 接口完成。
+
+**消息采集（UIA 直接提取为主，剪贴板为回退）：**
 
 ```python
 from pywinauto import Application
 from pywinauto.keyboard import send_keys
-import win32clipboard
-import time
+import re
 
 class QQAutomation:
     def __init__(self):
-        self.app = Application(backend="uia").connect(title_re=".*QQ.*")
+        # 三策略连接：精确title → 进程PID → title_re模式
+        self.app = Application(backend="uia").connect(title="QQ")
     
     def copy_chat_content(self, group_hwnd):
-        """激活群窗口，复制全部聊天文本"""
+        """提取群聊天消息文本（UIA优先，剪贴板回退）"""
         activate_window(group_hwnd)
         dlg = self.app.window(handle=group_hwnd)
-        # 优先尝试点击消息列表区域获取焦点，确保后续Ctrl+A作用于聊天记录而非输入框
-        msg_list = dlg.child_window(auto_id="message_list", control_type="List")
-        if msg_list.exists():
-            msg_list.click_input()
-        else:
-            # 降级：尝试通过 class_name 定位消息区域
-            try:
-                dlg.child_window(class_name="ChatWnd").click_input()
-            except:
-                dlg.click_input()  # 最后降级：点击窗口中心
-        time.sleep(random.uniform(0.2, 0.4))
-        send_keys('^a')   # Ctrl+A 全选聊天记录
-        send_keys('^c')   # Ctrl+C 复制
-        time.sleep(random.uniform(0.2, 0.4))
-        return self._get_clipboard_text()
+        # 主方案：直接读取 UIA 消息列表树
+        text = self._extract_messages_via_uia(dlg)
+        if text:
+            return text
+        # 回退方案：剪贴板 Ctrl+A / Ctrl+C
+        return self._retry_clipboard_copy()
     
-    def _get_clipboard_text(self):
-        win32clipboard.OpenClipboard()
-        try:
-            return win32clipboard.GetClipboardData(win32clipboard.CF_UNICODETEXT)
-        except:
+    def _extract_messages_via_uia(self, dlg):
+        """通过 UIA '消息列表' 元素直接读取消息文本。
+        
+        QQ NT 的聊天窗口使用 Direct3D 渲染视觉内容，但其 UIA 树完整
+        暴露了消息结构：Window "消息列表" → Group ml-root → 子节点序列。
+        每条消息由 发送者(Group名称) → 内容(Text) → 时间戳(Text) 组成。
+        
+        返回格式与剪贴板 Ctrl+A/Ctrl+C 输出完全一致，message_parser 无需修改。
+        """
+        msg_list = dlg.child_window(title="消息列表", control_type="Window")
+        if not msg_list.exists():
             return ""
-        finally:
-            win32clipboard.CloseClipboard()
-    
+        ml_root = msg_list.children()[0]
+        # 遍历子节点：日期分隔线 → 发送者 → 内容 → 时间戳 → 下一个发送者 → ...
+        messages = []
+        current_date = ""; current_sender = ""; current_content = ""; last_time = ""
+        for child in ml_root.children():
+            name = child.window_text()
+            texts = [sc.window_text() for sc in child.children()
+                     if sc.element_info.control_type == "Text"]
+            text = texts[0] if texts else ""
+            if re.match(r'\d{4}/\d{2}/\d{2}', text):     # 日期分隔线
+                current_date = text[:10].replace('/', '-')
+            elif re.match(r'(上午|下午|凌晨|昨天)\s*\d{1,2}:\d{2}', text):
+                last_time = self._to_24h(text)            # 时间戳 → 24小时制
+                if current_content:
+                    messages.append({"sender": current_sender,
+                        "time": f"{current_date} {last_time}",
+                        "content": current_content.strip()})
+                    current_content = ""
+            elif name and not texts:                       # 发送者
+                if current_sender and current_content:
+                    # 同一发送者的连续消息共享时间戳
+                    messages.append(...)
+                current_sender = name; current_content = ""
+            elif not name and texts and current_sender:    # 消息内容
+                current_content = text
+        # 格式化输出（与剪贴板 Ctrl+A/Ctrl+C 输出格式一致）
+        return "\n".join(f"{m['sender']} {m['time']}\n{m['content']}\n"
+                         for m in messages)
+```
+
+**消息发送（模拟输入）：**
+```python
     def send_to_contact(self, contact_name, message):
         """发送消息给指定联系人（单人窗口）"""
         hwnd = find_window_by_title(contact_name)
@@ -277,7 +312,6 @@ class QQAutomation:
             raise Exception(f"无法打开联系人窗口: {contact_name}")
         activate_window(hwnd)
         dlg = self.app.window(handle=hwnd)
-        # 输入框通常有 auto_id "input_edit"
         input_box = dlg.child_window(auto_id="input_edit", control_type="Edit")
         input_box.click_input()
         input_box.type_keys(message, with_spaces=True)
