@@ -6,7 +6,7 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 QQ Group Chat Product Model Monitoring System — a Windows desktop app that monitors QQ group messages via UI automation (keyboard/mouse simulation, no protocol hacking) and notifies a contact when messages match product model numbers from a CSV.
 
-Target platform: Windows Server 2022 + QQ NT 9.9.9+ + Python 3.14.5.
+Target platform: Windows Server 2022 + QQ NT 9.9.30+ (64-bit, Electron + C++ NT内核) + Python 3.14.5.
 
 ## Commands
 
@@ -16,6 +16,9 @@ pip install pywinauto pywin32 pynput psutil
 
 # Run the monitor
 python main.py
+
+# Dry-run verification (no QQ messages sent)
+python main.py --dry-run
 
 # Run the watchdog (keeps QQ.exe and main.py alive)
 python watchdog.py
@@ -39,11 +42,10 @@ message_parser.py — Parse clipboard text into structured messages (sender, tim
 tracker.py        — Incremental dedup via MD5 fingerprints (sender+time+first100chars)
 matcher.py        — Load CSV model list, case-insensitive substring matching
 notifier.py       — Cooldown-per-(group,model), dispatch via QQAutomation
-archiver.py       — Append new messages to daily CSV files (messages_YYYY-MM-DD.csv)
 watchdog.py       — Monitor QQ.exe and main.py via psutil, restart if missing
 ```
 
-**Data flow per polling cycle:** Activate group window → End (scroll to bottom) → Ctrl+A, Ctrl+C → Read clipboard → Parse messages → Diff fingerprints (incremental) → Archive new messages → Match models → Notify (with cooldown).
+**Data flow per polling cycle:** Activate group window → End (scroll to bottom) → Ctrl+A, Ctrl+C → Read clipboard → Parse messages → Diff fingerprints (incremental) → Match models → Notify (with cooldown).
 
 ## Key Constraints
 
@@ -55,15 +57,14 @@ watchdog.py       — Monitor QQ.exe and main.py via psutil, restart if missing
 
 ## Configuration
 
-`config.json` (JSON, loaded at startup, no hot-reload):
+`config.jsonc` (JSONC, loaded at startup, no hot-reload):
 
-```json
+```jsonc
 {
     "groups": [{"name": "群名称", "number": "群号"}],
     "target_contact": "联系人名称",
     "poll_interval_seconds": 60,
     "product_csv_path": "D:\\monitor\\products.csv",
-    "archive_dir": "D:\\monitor\\archives",
     "log_dir": "D:\\monitor\\logs",
     "cooldown_sec": 30,
     "match_case_sensitive": false
