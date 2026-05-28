@@ -10,9 +10,9 @@
     // 轮询间隔（秒），默认60
     "poll_interval_seconds": 60,
     // 产品型号CSV文件路径
-    "product_csv_path": "D:\\AIProjects\\QQMonitor2\\product_list.csv",
+    "product_csv_path": "C:\\AIProjects\\QQMonitor2\\product_list.csv",
     // 日志文件目录
-    "log_dir": "D:\\AIProjects\\QQMonitor2\\logs",
+    "log_dir": "C:\\AIProjects\\QQMonitor2\\logs",
     // 同型号同群通知冷却时间（秒），默认30
     "cooldown_sec": 30,
     // 型号匹配是否区分大小写，默认false（不区分）
