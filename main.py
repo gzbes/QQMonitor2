@@ -230,12 +230,10 @@ def main():
                             msg["sender"],
                             truncate_message(msg["content"]),
                         )
-                        sent = notifier.send(gname, msg, matched)
+                        sent_count = notifier.send(gname, msg, matched)
                         cycle_stats["matches"] += len(matched)
-                        if sent:
-                            cycle_stats["notifications"] += 1
-                        else:
-                            cycle_stats["cooldown_skipped"] += 1
+                        cycle_stats["notifications"] += sent_count
+                        cycle_stats["cooldown_skipped"] += len(matched) - sent_count
 
             except Exception:
                 logger.error("处理群 %s 时出错", gname, exc_info=True)

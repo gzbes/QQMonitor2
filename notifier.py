@@ -11,9 +11,9 @@ logger = logging.getLogger(__name__)
 class NotificationService:
     """Cooldown-gated notification dispatch via QQAutomation.
 
-    When the same (group, model) pair appears within `cooldown_sec`, it is
-    skipped.  Multiple models matched in the same message are merged into a
-    single notification with models separated by "、".
+    When the same (group, model, sender) triple appears within `cooldown_sec`,
+    it is skipped.  Each model matched in a message is sent as a separate
+    notification so the recipient can act on them individually.
     """
 
     def __init__(
@@ -36,40 +36,38 @@ class NotificationService:
             if self._dry_run_path:
                 self._dry_run_path.parent.mkdir(parents=True, exist_ok=True)
 
-    def send(self, group_name: str, message_obj: dict, matched_models: list[str]) -> bool:
-        """Send one merged notification for all non-cooldown models in `matched_models`.
+    def send(self, group_name: str, message_obj: dict, matched_models: list[str]) -> int:
+        """Send one notification per non-cooldown model in `matched_models`.
 
-        Returns True if a notification was actually sent (or written in dry-run mode).
-        Returns False if every model was skipped due to cooldown.
+        Returns the number of notifications actually sent.
         """
         if not matched_models:
-            return False
+            return 0
 
         sender = message_obj.get("sender", "")
         now = time.time()
-        active_models = []
+        sent_count = 0
+
         for model in matched_models:
             key = (group_name, model, sender)
-            if now - self._last_sent.get(key, 0) >= self._cooldown:
-                active_models.append(model)
-                self._last_sent[key] = now
+            if now - self._last_sent.get(key, 0) < self._cooldown:
+                continue
 
-        if not active_models:
-            return False
+            self._last_sent[key] = now
+            notification = (
+                f"{group_name}群里出现{model}信息："
+                f"{message_obj['sender']}-{message_obj['time']}:\n"
+                f"原文：{message_obj['content'][:100]}"
+            )
 
-        models_str = "、".join(active_models)
-        notification = (
-            f"{group_name}群里出现{models_str}信息："
-            f"{message_obj['sender']}-{message_obj['time']}:\n"
-            f"原文：{message_obj['content'][:100]}"
-        )
+            if self._dry_run:
+                self._write_dry_run(notification, group_name, [model], message_obj)
+            else:
+                self._qq.send_to_contact(self._target, notification)
 
-        if self._dry_run:
-            self._write_dry_run(notification, group_name, active_models, message_obj)
-            return True
+            sent_count += 1
 
-        self._qq.send_to_contact(self._target, notification)
-        return True
+        return sent_count
 
     def _write_dry_run(self, notification: str, group_name: str, models: list[str], msg: dict) -> None:
         """Log the notification to the dry-run verification file and INFO log."""

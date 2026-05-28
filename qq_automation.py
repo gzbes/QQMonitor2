@@ -8,6 +8,8 @@ import time
 
 import psutil
 import win32clipboard
+import win32con
+import win32gui
 from pywinauto import Application
 from pywinauto.keyboard import send_keys
 
@@ -110,28 +112,39 @@ class QQAutomation:
     def copy_chat_content(self, group_hwnd: int) -> str:
         """Extract chat messages from the group window.
 
-        Primary strategy: read text directly from the UIA '消息列表' tree
-        (bypasses clipboard, no focus/selection needed).
-        Fallback: Ctrl+A / Ctrl+C clipboard copy.
+        Primary: clipboard via Ctrl+A/Ctrl+C — QQ's JS-level select-all
+        captures the full chat history, not just the rendered viewport.
+        Force-activates the window first so keystrokes reach QQ reliably.
+
+        Fallback: UIA tree extraction — limited to ~17 viewport messages
+        but works even when the window cannot receive keystrokes.
         """
         activate_window(group_hwnd)
         dlg = self.app.window(handle=group_hwnd)
 
-        text = self._extract_messages_via_uia(dlg)
+        # --- Primary: clipboard (full history) ---
+        self._force_activate_window(dlg, group_hwnd)
+        time.sleep(random.uniform(0.3, 0.5))
+        send_keys("{END}")
+        time.sleep(random.uniform(0.2, 0.3))
+        send_keys("{DOWN}")
+        time.sleep(random.uniform(0.1, 0.2))
+        text = self._retry_clipboard_copy(dlg)
         if text:
             return text
 
         if self._shutdown_event and self._shutdown_event.is_set():
-            logger.info("Shutdown requested, skipping clipboard fallback")
+            logger.info("Shutdown requested, skipping UIA fallback")
             return ""
 
-        logger.info("UIA extraction returned empty, falling back to clipboard for group window")
-        self._focus_message_list(dlg)
-        send_keys("{END}")
-        time.sleep(random.uniform(0.2, 0.3))
-        send_keys("{DOWN}")  # activate a visible message so Ctrl+A works in Electron webview
-        time.sleep(random.uniform(0.1, 0.2))
-        return self._retry_clipboard_copy(dlg)
+        # --- Fallback: UIA extraction (viewport only) ---
+        logger.info("Clipboard extraction failed, falling back to UIA")
+        text = self._extract_messages_via_uia(dlg)
+        if text:
+            return text
+
+        logger.warning("Both clipboard and UIA extraction failed for group window")
+        return ""
 
     # ------------------------------------------------------------------
     # UIA message extraction
@@ -354,6 +367,26 @@ class QQAutomation:
                             idx, ctrl, name, sub, extra)
             except Exception:
                 logger.info("UIA msg_list[%d]: <error>", idx)
+
+    def _force_activate_window(self, dlg, hwnd: int) -> None:
+        """Aggressively activate a window so it can receive keystrokes reliably.
+
+        Uses multiple Windows API calls in sequence, then clicks the message
+        area to generate a real mouse event. This is the strongest signal to
+        Electron/Chromium that the window is active and should accept input.
+        """
+        win32gui.SetActiveWindow(hwnd)
+        win32gui.BringWindowToTop(hwnd)
+        win32gui.SetForegroundWindow(hwnd)
+        time.sleep(random.uniform(0.2, 0.3))
+
+        # Click the message area (center, 40% height) to focus the message
+        # list so that Ctrl+A/Ctrl+C target the chat content.
+        rect = dlg.rectangle()
+        click_x = rect.width() // 2
+        click_y = int(rect.height() * 0.4)
+        dlg.click_input(coords=(click_x, click_y))
+        time.sleep(random.uniform(0.2, 0.3))
 
     def _focus_message_list(self, dlg) -> None:
         """Three-tier focus: auto_id → class_name → center click."""
