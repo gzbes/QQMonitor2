@@ -1,19 +1,20 @@
 {
     // 监控群组列表：name 为群显示名称，number 为群号（优先按群号匹配窗口标题）
     "groups": [
-        {"name": "我和我的爱人", "number": "1106089462"}
-       // {"name": "JST.TE、MOLEX 接插件、连接器交流群", "number": "498105124"}
+        {"name": "中华连接器协会", "number": "125483468"},
+        {"name": "中国线束连接器总群", "number": "139256379"},
+        {"name": "JST.TE、MOLEX 接插件、连接器交流群", "number": "498105124"}
     ],
     // 接收通知的QQ联系人显示名称
     "target_contact": "冬天的绿叶",
     // 轮询间隔（秒），默认60
-    "poll_interval_seconds": 10,
+    "poll_interval_seconds": 60,
     // 产品型号CSV文件路径
     "product_csv_path": "D:\\AIProjects\\QQMonitor2\\product_list.csv",
     // 日志文件目录
     "log_dir": "D:\\AIProjects\\QQMonitor2\\logs",
     // 同型号同群通知冷却时间（秒），默认30
-    "cooldown_sec": 3,
+    "cooldown_sec": 30,
     // 型号匹配是否区分大小写，默认false（不区分）
     "match_case_sensitive": false,
     // 窗口/剪贴板操作重试次数
@@ -21,7 +22,7 @@
     // 重试基础间隔（秒），实际使用递增退避
     "retry_delay_sec": 1,
     // 群间处理间隔（秒），使用随机抖动
-    "inter_group_delay_sec": 5,
+    "inter_group_delay_sec": 10,
     // 单个日志文件最大字节数（10MB）
     "log_max_bytes": 10485760,
     // 保留的日志备份数量

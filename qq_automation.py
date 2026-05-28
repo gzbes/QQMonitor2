@@ -519,7 +519,7 @@ class QQAutomation:
             input_box.click_input()
             time.sleep(random.uniform(0.1, 0.2))
         else:
-            logger.warning("Input box not found via UIA, clicking bottom area")
+            logger.info("Input box not found via UIA, clicking bottom area")
             self._click_bottom(dlg)
             time.sleep(random.uniform(0.1, 0.2))
 

@@ -24,7 +24,7 @@ main.py (主循环)
     ├── MessageParser    — 解析剪贴板文本 → 结构化消息、过滤系统/非文本消息、消息截断函数
     ├── IncrementalTracker — MD5 指纹增量去重（50,000条上限自动修剪）
     ├── ProductMatcher   — 加载 CSV 型号（自动检测编码）、不区分大小写包含匹配
-    ├── NotificationService — (群, 型号) 冷却去重、多型号合并通知、演习模式写验证文件
+    ├── NotificationService — (群, 型号, 发送者) 三元组独立冷却去重、多型号合并通知、演习模式写验证文件
 
 watchdog.py (独立进程)
 ├── 每 30 秒检查 QQ.exe 是否运行 → 崩溃则重启（依赖QQ保存密码自动登录）
@@ -32,9 +32,9 @@ watchdog.py (独立进程)
 └── QQ 自动登录失败时记录 ERROR 日志提醒运维人员
 ```
 
-**每个轮询周期的数据流：** 激活群窗口 → UIA 直接读取 `Window "消息列表"` 文本 → 格式化输出 → 解析消息 → 过滤系统/非文本消息 → 增量指纹比对 → 型号匹配 → 多型号合并 → 冷却检查 → 发通知（或演习模式写文件）
+**每个轮询周期的数据流：** 激活群窗口 → UIA 双策略解析（当前布局优先 → 旧版兼容回退）→ 解析消息 → 过滤系统/非文本消息 → 增量指纹比对 → 型号匹配 → 多型号合并 → 冷却检查 → 发通知（或演习模式写文件）
 
-若 UIA 元素不可用（QQ 版本升级改变了树结构），回退到：激活群窗口 → 点击消息区域 → End（滚到底部）→ Ctrl+A, Ctrl+C → 读剪贴板 → ...
+若 UIA 双策略均失败（QQ 版本大变），回退到：四层焦点降级定位消息区 → End（滚到底部）→ Down（激活可见消息）→ 系统级 send_keys Ctrl+A/Ctrl+C → 每轮3次读剪贴板 → ...
 
 ---
 
@@ -93,7 +93,16 @@ pywinauto 的 `auto_id` 值（`message_list`、`input_edit`、`search_box`）可
 `IncrementalTracker` 每组最多存储 50,000 条指纹，超出时修剪较早的一半。正常情况（聊天窗口通常仅显示最近几百条消息）不会触发，仅为长时间运行提供安全保障。
 
 ### 5. 优雅关闭
-`main.py` 捕获 SIGINT 和 SIGTERM 信号，设置关闭标志。轮询间隔的等待被拆分为 1 秒的子等待，确保关闭延迟不超过 1 秒。
+`main.py` 使用 `threading.Event` 替代全局布尔标志实现优雅关闭。信号处理器 (`SIGINT`/`SIGTERM`) 调用 `_shutdown_event.set()`。
+
+关闭检查点分布在：
+- **主循环条件**：`while not _shutdown_event.is_set()`
+- **群处理循环**：每个群处理前 `break` 检查，避免继续处理剩余群
+- **剪贴板重试循环**：每次重试前检查，避免 3 轮退避延迟（最多可省 6 秒）
+- **剪贴板回退入口**：UIA 失败后、启动剪贴板方案前检查，跳过不必要的操作
+- **轮询间隔**：1 秒子等待拆分，确保关闭延迟 ≤ 1 秒
+
+`QQAutomation` 构造函数接受 `shutdown_event` 参数，传递给内部重试方法。
 
 ### 6. 双通道日志
 - RotatingFileHandler：INFO+ 级别写入 `log_dir/monitor.log`（10MB 按大小轮转，保留 5 个备份）
@@ -104,9 +113,14 @@ pywinauto 的 `auto_id` 值（`message_list`、`input_edit`、`search_box`）可
 `_find_child()` 优先按 `auto_id` 精确定位，失败则尝试 `control_type`/`class_name` 模糊匹配，最后回退到窗口中心点击。
 
 ### 8. 连接韧性
-`QQAutomation.__init__()` 采用三策略连接：精确标题匹配（`title="QQ"`）→ 进程 PID 连接（通过 `psutil` 查找 `QQ.exe` 进程）→ `title_re` 模式匹配。有 10-15 秒超时。连接失败直接报 Fatal 退出，而非静默失败。
+`QQAutomation.__init__()` 采用三策略降级连接：
+1. **精确标题匹配**（`title="QQ"`）— 最可靠，QQ NT 窗口标题为精确的 `QQ` 字符串
+2. **进程 PID 连接**（通过 `psutil` 查找 `QQ.exe` 进程 PID，`connect(process=pid)`）
+3. **`title_re` 模式匹配**（配置中的正则，默认 `^QQ$`）
 
-**背景：** QQ NT 窗口标题为精确的 `QQ` 字符串。使用宽泛的 `title_re=".*QQ.*"` 会导致 `ElementAmbiguousError`，因为会匹配到 VS Code 项目名、资源管理器文件夹名等包含"QQ"字样的窗口。默认配置使用 `^QQ$` 精确匹配，并通过三策略降级确保连接成功。
+每策略 10 秒超时。全部失败则 Fatal 退出。
+
+**背景：** 使用宽泛的 `title_re=".*QQ.*"` 会导致 `ElementAmbiguousError`，因为会匹配到 VS Code 项目名、资源管理器文件夹名等包含"QQ"字样的窗口。默认配置使用 `^QQ$` 精确匹配。
 
 ### 9. 随机抖动（Jitter）替代固定 Sleep
 所有窗口操作后的等待时间使用 `random.uniform()` 随机化：
@@ -118,66 +132,86 @@ pywinauto 的 `auto_id` 值（`message_list`、`input_edit`、`search_box`）可
 
 目的：避免固定时序在特定系统环境下产生的竞态条件，同时使操作模式更接近真人行为。
 
-### 10. 消息采集：UIA 直接文本提取（主方案）
+### 10. 消息采集：UIA 双策略直接文本提取（主方案）
 QQ NT 基于 Electron + Direct3D 渲染，其消息列表 webview 无法通过传统的"点击 → 焦点 → Ctrl+A/Ctrl+C"方式可靠获取文本。键盘快捷键在 D3D 渲染的 Electron 窗口中无法可靠定向到消息区域——即使窗口已前台激活（`SetForegroundWindow` 成功），`Ctrl+A` 仍然作用在输入框而非消息列表。
 
-**解决方案：** 直接通过 Windows UIA 无障碍树提取消息文本。QQ NT 尽管用 D3D 渲染视觉内容，其 UIA 树完整暴露了消息结构：
+**解决方案：** 直接通过 Windows UIA 无障碍树提取消息文本。QQ NT 尽管用 D3D 渲染视觉内容，其 UIA 树完整暴露了消息结构。
 
+**当前 QQ NT 布局（主力策略）：** 消息作为 `msg_list` 的直接 Group 子节点：
 ```
-Window "消息列表" (ChatWnd 的无障碍表示)
-  └─ Group ml-root
-       ├─ Text "2026/05/16 14:29"        ← 日期分隔线
-       ├─ Group "发送者名称"               ← 新消息开始
-       ├─ Group → Text "消息正文内容"      ← 消息正文
-       ├─ Group → Text "下午 13:24"       ← 时间戳（消息结束标记）
-       └─ Group "下一个发送者" ...
+Window "消息列表"
+  ├─ Text "2026/05/16"                     ← 日期分隔线
+  ├─ Group "发送者名称" (0 子节点)           ← 新消息开始（名称=发送者，无子节点）
+  ├─ Group "消息正文" (≥1 子节点)            ← 消息内容（名称=内容文本）
+  ├─ Group "" (空名称 + Text 子节点)         ← 消息内容变体（富文本/多行时）
+  ├─ Text "下午 14:29"                      ← 时间戳
+  └─ Group "下一个发送者" ...
 ```
 
-`copy_chat_content()` 流程：
-1. 激活窗口（确保 UIA 树已渲染）
-2. 定位 `Window "消息列表"` → `Group "ml-root"` → 遍历子节点
-3. 解析消息结构（日期分隔线 → 发送者 → 内容 → 时间戳 → 循环）
-4. 格式化为与剪贴板 Ctrl+A/Ctrl+C 输出完全相同的文本
-5. 若 UIA 树结构不匹配（QQ 版本升级），回退到剪贴板方案
+**旧版兼容布局（回退策略）：** 消息嵌套在 `ml-root` Group 下：
+```
+Window "消息列表"
+  └─ Group "ml-root"
+       ├─ Text "2026/05/16 14:29"          ← 日期分隔线
+       ├─ Group "发送者名称"                 ← 发送者
+       ├─ Group → Text "消息正文内容"        ← 消息内容
+       └─ Group → Text "下午 14:29"         ← 时间戳
+```
 
-**优势：**
-- 无需焦点管理、无需键盘模拟、无需剪贴板操作
-- 不受 Electron 内部焦点机制影响
-- 消息提取完全可靠，不受窗口是否前台激活的影响（只要窗口未最小化到托盘）
-- UIA 文本是 Python 原生 Unicode 字符串，无编码问题
+`_extract_messages_via_uia()` 流程：
+1. 定位 `Window "消息列表"` 元素
+2. **策略1** — `_parse_current_layout()`：直接遍历 `msg_list.children()`，按 Group 特征分类：有名称+0子节点→发送者、有名称+≥1子节点→内容、空名称+Text子节点→内容变体、Text→时间戳。连续空名称 Group 自动拼接为多行消息
+3. **策略2**（策略1失败时）— `_try_parse_legacy()`：遍历 `ml_root.children()` 的 Group→Text 嵌套结构
+4. 两种策略均失败时调用 `_dump_uia_tree()` 输出前10个子节点的诊断信息（control_type、名称、子节点数、子节点文本），辅助排查 QQ 版本变化
+5. 格式化输出与剪贴板 Ctrl+A/Ctrl+C 格式完全一致，`message_parser` 无需修改
+
+**消息列表焦点（仅剪贴板回退时使用）：** 四层降级链
+1. `auto_id='message_list'` — 最精确
+2. `class_name='ChatWnd'` — QQ NT 消息区类名
+3. 通用 `List` control — 兜底匹配
+4. 消息区坐标点击（窗口 40% 高度处，避开底部输入框）
+
+**剪贴板回退方案：** 使用系统级 `send_keys()`（非 `dlg.type_keys()`），因为 QQ NT Electron webview 仅响应系统级键盘事件。每次 Ctrl+C 后读剪贴板 3 次应对数据到达延迟。重试 3 轮，递增退避。
 
 ### 11. 多型号合并通知
-`NotificationService.send()` 将一条消息匹配到的所有型号合并在一条 QQ 消息中发送（型号用顿号分隔），而非每个型号单独发送。合并前对每个 `(群, 型号)` 组合独立做冷却检查，仅将未冷却的型号纳入通知。
+`NotificationService.send()` 将一条消息匹配到的所有型号合并在一条 QQ 消息中发送（型号用顿号分隔），而非每个型号单独发送。合并前对每个 `(群, 型号, 发送者)` 三元组独立做冷却检查，仅将未冷却的型号纳入通知。
 
-### 12. JSONC 配置支持
+**冷却键设计：** 冷却键从 `(群, 型号)` 升级为 `(群, 型号, 发送者)`。同一发送者在冷却期内重复提及相同型号会被跳过，但不同发送者提及相同型号不受冷却影响（各自独立计时）。这避免了以下场景的漏报：用户 A 和用户 B 在同一群内先后求购相同型号，原本的二元组冷却会导致 B 的消息被错误跳过。
+
+### 12. 消息发送：剪贴板粘贴方案
+`send_to_contact()` 使用剪贴板 + `Ctrl+V` 替代 `type_keys()` 发送消息。原因：`type_keys()` 在 QQ NT Electron 输入框中处理中文时可能出现字符丢失或编码问题，而剪贴板粘贴方案通过 `CF_UNICODETEXT` 格式设置剪贴板后再模拟 `Ctrl+V`，确保中文文本完整可靠输入。
+
+输入框定位采用二级降级：配置的 `auto_id="input_edit"` → 通用 `Edit` 控件（取最后一个，QQ NT 聊天窗口通常只有一个大输入框）。均失败则点击窗口底部 90% 高度区域（输入框通常在底部）。
+
+### 13. JSONC 配置支持
 配置文件使用 JSONC 格式（`config.jsonc`），支持 `//` 单行注释和 `/* */` 块注释。`main.py` 加载时先用正则去除注释，再 `json.loads()` 解析。运维人员可直接在配置中添加说明注释，无需 `_comment` 伪字段。
 
-### 13. 窗口匹配优先群号
+### 14. 窗口匹配优先群号
 `find_window_by_title()` 调用时优先使用群号（纯数字，更精确）匹配窗口标题，未找到时降级使用群名称匹配。QQ NT 窗口标题通常包含群号。
 
-### 14. 消息过滤
+### 15. 消息过滤
 `message_parser.parse_qq_messages()` 解析后过滤：
 - **系统消息**：无发送者字段的消息（如加群/退群提示、好友通知等）
 - **非文本消息**：内容仅包含 `[图片]`/`[文件]`/`[动画表情]`/`[语音]` 等占位符而无实际文本的消息
 - 过滤后的消息才进入增量判断和型号匹配流程
 
-### 15. 日志消息截断
+### 16. 日志消息截断
 所有日志输出中的消息内容通过 `truncate_message(text, max_len=30)` 函数处理：超过 30 字符截断并以 `...` 结尾。该函数定义在 `message_parser.py`，供所有模块调用。
 
-### 16. 演习模式（Dry-Run）
+### 17. 演习模式（Dry-Run）
 `main.py` 支持 `--dry-run` 命令行参数：
 - 正常执行窗口激活、消息采集、解析、匹配全流程
 - `NotificationService` 在演习模式下不调用 `QQAutomation.send_to_contact()`，改为将通知内容写入 `dry_run_verification.log`（位于 `log_dir`）
 - 冷却计时正常运作（仅抑制实际发送）
 - 日志中标记 `[DRY-RUN]` 前缀
 
-### 17. 运行时指标收集
+### 18. 运行时指标收集
 `main.py` 主循环维护 `cycle_stats` 字典，每轮记录：消息总数、新增消息数、型号命中次数、通知发送次数、冷却跳过次数、各群处理耗时。每 10 轮输出汇总指标日志（INFO 级别），格式：
 ```
 [指标] 第N轮 | 总消息:X 新增:Y 命中:Z 通知:W | 耗时:X.Xs | 各群: 群A=X.Xs 群B=X.Xs
 ```
 
-### 18. 看门狗自动登录处理
+### 19. 看门狗自动登录处理
 `watchdog.py` 重启 QQ.exe 后等待 30 秒，通过 `is_qq_logged_in()` 检查 QQ 是否已登录（检查主窗口存在且标题不含"登录"字样）。QQ 客户端保存密码后可自动登录。若 30 秒后仍未检测到登录状态，记录 ERROR 日志提醒运维人员手动登录。
 
 ---
@@ -201,23 +235,23 @@ Window "消息列表" (ChatWnd 的无障碍表示)
     "product_csv_path": "D:\\monitor\\products.csv",
     // 日志文件目录
     "log_dir": "D:\\monitor\\logs",
-    // 同型号同群通知冷却时间（秒），默认30
+    // 同型号同群同发送者通知冷却时间（秒），默认30。不同发送者独立计时
     "cooldown_sec": 30,
     // 型号匹配是否区分大小写，默认false（不区分）
     "match_case_sensitive": false,
     // 窗口/剪贴板操作重试次数
     "retry_attempts": 3,
     // 重试基础间隔（秒），实际使用递增退避
-    "retry_delay_sec": 0.5,
+    "retry_delay_sec": 1,
     // 群间处理间隔（秒），使用随机抖动
-    "inter_group_delay_sec": 1.0,
+    "inter_group_delay_sec": 5,
     // 单个日志文件最大字节数（10MB）
     "log_max_bytes": 10485760,
     // 保留的日志备份数量
     "log_backup_count": 5,
     // pywinauto 元素定位器，QQ 版本变化时调整此处即可
     "ui_selectors": {
-        "main_window_title_pattern": ".*QQ.*",
+        "main_window_title_pattern": "^QQ$",
         "message_list": {"auto_id": "message_list", "control_type": "List"},
         "message_area_fallback": {"class_name": "ChatWnd"},
         "input_edit": {"auto_id": "input_edit", "control_type": "Edit"},
@@ -237,11 +271,11 @@ Window "消息列表" (ChatWnd 的无障碍表示)
 | `poll_interval_seconds` | int | 60 | 轮询间隔（秒） |
 | `product_csv_path` | string | 必填 | 产品型号 CSV 文件路径 |
 | `log_dir` | string | 必填 | 日志文件目录 |
-| `cooldown_sec` | int | 30 | 同型号同群通知冷却时间（秒） |
+| `cooldown_sec` | int | 30 | 同型号同群同发送者通知冷却时间（秒），不同发送者独立计时 |
 | `match_case_sensitive` | bool | false | 型号匹配是否区分大小写 |
 | `retry_attempts` | int | 3 | 剪贴板/窗口操作重试次数 |
-| `retry_delay_sec` | float | 0.5 | 重试基础间隔（秒），实际使用递增退避 |
-| `inter_group_delay_sec` | float | 1.0 | 群间处理间隔（秒），使用随机抖动避免固定时序 |
+| `retry_delay_sec` | float | 1 | 重试基础间隔（秒），实际使用递增退避 |
+| `inter_group_delay_sec` | float | 5 | 群间处理间隔（秒），使用随机抖动避免固定时序 |
 | `log_max_bytes` | int | 10485760 | 单个日志文件最大字节数（10MB） |
 | `log_backup_count` | int | 5 | 保留的日志备份数量 |
 
@@ -252,8 +286,8 @@ Window "消息列表" (ChatWnd 的无障碍表示)
 | 异常场景 | 处理方式 |
 |----------|----------|
 | 群窗口找不到 | WARNING 日志，跳过本次轮询，下一轮继续查找 |
-| UIA 消息列表元素缺失 | 自动回退到剪贴板方案 (Ctrl+A/Ctrl+C)，记录 DEBUG 日志 |
-| 剪贴板复制失败（回退方案） | 重试 3 次（每次尝试前清空剪贴板），递增退避（0.5s→1.0s→1.5s）；仍失败则 WARNING 日志跳过该群 |
+| UIA 消息列表元素缺失 / 双策略均无结果 | 自动回退到剪贴板方案，输出 UIA 树诊断信息（前10个子节点的 control_type、名称、子节点文本） |
+| 剪贴板复制失败（回退方案） | 系统级 send_keys() + 每轮3次读剪贴板，重试3轮，递增退避；仍失败则 WARNING 日志跳过该群。重试循环中检查 shutdown_event |
 | 联系人窗口丢失 | 尝试通过主窗口搜索重新打开；失败则 ERROR 日志，放弃本次通知 |
 | 单群处理异常 | try/except 包裹，记录 ERROR，继续处理下一个群（不崩溃） |
 | QQ 进程崩溃 | 看门狗检测后重启 QQ；QQ 保存密码可自动登录；若 30s 内未检测到登录状态则记录 ERROR |
@@ -261,6 +295,7 @@ Window "消息列表" (ChatWnd 的无障碍表示)
 | 主循环异常 | 捕获后记录 ERROR，continue 下一轮 |
 | 产品 CSV 加载失败 | Fatal 级别，程序退出（型号列表是关键依赖） |
 | QQ 连接失败（三策略全部失败） | Fatal 级别，程序退出（无法操作 QQ） |
+| 用户 Ctrl+C 中断 | threading.Event 秒级响应，在重试循环、群处理循环、轮询间隔子等待中均可检测 |
 
 ---
 

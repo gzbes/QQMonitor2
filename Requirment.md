@@ -4,6 +4,7 @@
 
 | 版本 | 日期 | 作者 | 变更说明 |
 |------|------|------|----------|
+| V2.2 | 2026-05-28 | 架构师 | 本地测试通过，准备云服务器部署。更新内容：(1) UIA 消息树解析升级为双策略（当前 QQ NT 布局 + 旧版兼容），支持空名称 Group 子节点文本提取和连续消息拼接；(2) 通知冷却键从 (群,型号) 改为 (群,型号,发送者)，避免不同发送者匹配同型号时互相屏蔽；(3) 优雅关闭从全局布尔标志升级为 threading.Event，剪贴板重试循环和群处理循环内均可响应；(4) QQ 连接升级为三策略降级（精确标题→进程PID→正则模式）；(5) 消息列表焦点改为四层降级链；(6) 消息发送改用剪贴板粘贴 (Ctrl+V) 确保中文可靠输入 |
 | V2.1 | 2026-05-27 | 架构师 | 消息采集方案升级：UIA 无障碍树直接读取为主方案，剪贴板 Ctrl+A/Ctrl+C 为回退。解决 QQ NT Electron+D3D 渲染下键盘快捷键无法可靠定向到消息列表的问题 |
 | V2.0 | 2026-05-27 | 架构师 | 基于V1.0优化：合并目标流程、改进增量采集方式、增加去重冷却、明确部署约束 |
 
@@ -67,11 +68,14 @@
 #### 3.4 消息采集与增量判断（优化版）
 - **主要方案（UIA 直接读取）**：通过 Windows UIA 无障碍接口直接定位 QQ NT 聊天窗口中的 `Window "消息列表"` 元素，遍历其子节点树（`ml-root` Group），提取每条消息的发送者（Group 名称）、时间戳（`上午/下午/昨天 HH:MM` 格式的 Text 子节点）、正文内容。此方案无需焦点切换、键盘模拟或剪贴板操作，不受 Electron webview 焦点机制的限制。
 - **回退方案（剪贴板复制）**：当 UIA 元素不可用时（如 QQ 版本升级改变了 UIA 树结构），回退到模拟 `End` 键滚动到底部（确保最新消息可见），然后 `Ctrl+A` + `Ctrl+C` 复制当前聊天区域的全部文本。
-- **QQ NT UIA 消息树结构**：聊天窗口 → `Window "消息列表"` → `Group "ml-root"` → 子节点序列：
-  - `Text "YYYY/MM/DD HH:MM"` — 日期分隔线
-  - `Group "发送者名称"` — 新消息开始（Group 自身名称为发送者）
-  - `Group → Text "消息正文"` — 消息内容（空名称 Group + Text 子节点）
-  - `Group → Text "上午/下午/昨天 HH:MM"` — 时间戳（标记消息结束）
+- **QQ NT UIA 消息树结构（当前版本）**：聊天窗口 → `Window "消息列表"` → 直接子节点序列（消息不再嵌套在 `ml-root` 下）：
+  - `Text "YYYY/MM/DD"` — 日期分隔线
+  - `Group "发送者名称"` (0 个子节点) — 新消息开始（Group 自身名称即发送者，无子节点）
+  - `Group "消息正文"` (≥1 个子节点) — 消息内容（Group 自身名称即为内容文本）
+  - `Group ""` (空名称 + Text 子节点) — 消息内容变体（当内容包含富文本/换行时，文本在子节点中）
+  - `Text "上午/下午/昨天 HH:MM"` — 时间戳（标记消息结束）
+  - 连续的空名称 Group 会被自动拼接为一条多行消息
+- **旧版兼容布局**：`Window "消息列表"` → `Group "ml-root"` → 子节点序列（`Group "发送者"` → `Text "内容"` → `Text "时间戳"`），程序自动探测并回退
 - 解析剪贴板文本（回退方案时），提取每条消息的**发送者、时间、内容**。
 - **消息过滤**：忽略系统消息（如加群/退群/好友提示等无发送者的系统通知）、非文本消息（如图片、文件、贴纸、语音等仅显示 `[图片]`/`[文件]`/`[动画表情]` 占位符的无文本内容消息）。仅对包含文本内容的消息做后续处理。
 - **增量判断**：记录每个群**上一次成功采集的消息指纹**（指纹 = 发送者 + 完整时间戳(含日期) + 内容前100字符的MD5）。本次采集的消息与上次指纹集合比较，**仅处理新增消息**，避免重复通知。
@@ -85,8 +89,8 @@
 - 向指定的QQ联系人（单个账号）发送通知消息。
 - 实现方式：通过UI自动化切换到该联系人的聊天窗口（若窗口未打开，通过QQ主界面搜索并打开），将通知文本输入输入框，模拟回车发送。
 - **去重与频率限制**：
-  - 同一群组的同一条消息（按消息指纹）即使匹配多个型号，也只发一次通知。
-  - 对 `(群名, 型号)` 组合设置**冷却时间**（默认30秒），冷却期内即使新消息命中相同型号也不再发送，避免刷屏。
+  - 同一群组的同一条消息（按消息指纹）即使匹配多个型号，也只发一次通知，多个型号用顿号合并为一条通知。
+  - 对 `(群名, 型号, 发送者)` 三元组设置**冷却时间**（默认30秒）。同一发送者在冷却期内重复提及相同型号会被跳过，但不同发送者提及相同型号不受冷却影响（各自独立计时），避免遗漏不同客户的求购需求。
 - 发送后记录日志。
 
 #### 3.7 日志记录
@@ -197,7 +201,8 @@
                         ┌──────────────────┐
                         │ Notification     │
                         │ - 多型号合并通知  │
-                        │ - (群,型号)冷却   │
+                        │ - (群,型号,发送者)│
+                        │   三元组独立冷却  │
                         │ - 演习模式写文件  │
                         │ - 调用QQAutomation│
                         └──────────────────┘
@@ -242,67 +247,65 @@ from pywinauto.keyboard import send_keys
 import re
 
 class QQAutomation:
-    def __init__(self):
-        # 三策略连接：精确title → 进程PID → title_re模式
-        self.app = Application(backend="uia").connect(title="QQ")
+    def __init__(self, config, shutdown_event=None):
+        # 三策略连接降级：精确标题 "QQ" → 进程PID (psutil) → title_re 模式
+        # 默认 title_re 使用 "^QQ$" 精确匹配，避免匹配到含"QQ"字样的其他窗口
+        self.app = self._connect_to_qq()
     
     def copy_chat_content(self, group_hwnd):
         """提取群聊天消息文本（UIA优先，剪贴板回退）"""
         activate_window(group_hwnd)
         dlg = self.app.window(handle=group_hwnd)
-        # 主方案：直接读取 UIA 消息列表树
+        # 主方案：直接读取 UIA 消息列表树（双策略解析器）
         text = self._extract_messages_via_uia(dlg)
         if text:
             return text
-        # 回退方案：剪贴板 Ctrl+A / Ctrl+C
-        return self._retry_clipboard_copy()
+        # 回退方案：四层焦点降级 + 剪贴板 Ctrl+A/Ctrl+C
+        if shutdown_event and shutdown_event.is_set():
+            return ""
+        self._focus_message_list(dlg)  # 四层降级确保焦点在消息区
+        send_keys("{END}")
+        send_keys("{DOWN}")   # 激活一条可见消息，使 Electron webview 响应 Ctrl+A
+        return self._retry_clipboard_copy(dlg)  # 系统级 send_keys + 每轮3次读剪贴板
     
     def _extract_messages_via_uia(self, dlg):
-        """通过 UIA '消息列表' 元素直接读取消息文本。
+        """双策略 UIA 解析器：当前布局 → 旧版兼容布局。
         
-        QQ NT 的聊天窗口使用 Direct3D 渲染视觉内容，但其 UIA 树完整
-        暴露了消息结构：Window "消息列表" → Group ml-root → 子节点序列。
-        每条消息由 发送者(Group名称) → 内容(Text) → 时间戳(Text) 组成。
+        当前 QQ NT 布局：msg_list.children() 直接迭代，
+        识别发送者 Group(有名称+0子节点)、内容 Group(有名称+≥1子节点)、
+        空名称 Group(文本在子节点中)、时间戳 Text。
+        连续空名称 Group 自动拼接为多行消息。
         
-        返回格式与剪贴板 Ctrl+A/Ctrl+C 输出完全一致，message_parser 无需修改。
+        旧版兼容布局：ml_root.children() 遍历 Group→Text 嵌套结构。
+        
+        两种策略均失败时输出 UIA 树诊断信息（dump）辅助排查。
         """
-        msg_list = dlg.child_window(title="消息列表", control_type="Window")
-        if not msg_list.exists():
-            return ""
-        ml_root = msg_list.children()[0]
-        # 遍历子节点：日期分隔线 → 发送者 → 内容 → 时间戳 → 下一个发送者 → ...
-        messages = []
-        current_date = ""; current_sender = ""; current_content = ""; last_time = ""
-        for child in ml_root.children():
-            name = child.window_text()
-            texts = [sc.window_text() for sc in child.children()
-                     if sc.element_info.control_type == "Text"]
-            text = texts[0] if texts else ""
-            if re.match(r'\d{4}/\d{2}/\d{2}', text):     # 日期分隔线
-                current_date = text[:10].replace('/', '-')
-            elif re.match(r'(上午|下午|凌晨|昨天)\s*\d{1,2}:\d{2}', text):
-                last_time = self._to_24h(text)            # 时间戳 → 24小时制
-                if current_content:
-                    messages.append({"sender": current_sender,
-                        "time": f"{current_date} {last_time}",
-                        "content": current_content.strip()})
-                    current_content = ""
-            elif name and not texts:                       # 发送者
-                if current_sender and current_content:
-                    # 同一发送者的连续消息共享时间戳
-                    messages.append(...)
-                current_sender = name; current_content = ""
-            elif not name and texts and current_sender:    # 消息内容
-                current_content = text
-        # 格式化输出（与剪贴板 Ctrl+A/Ctrl+C 输出格式一致）
-        return "\n".join(f"{m['sender']} {m['time']}\n{m['content']}\n"
-                         for m in messages)
+        ...
+        return formatted_text  # 与 Ctrl+A/Ctrl+C 输出格式一致
+    
+    def _focus_message_list(self, dlg):
+        """四层焦点降级链：
+        1. auto_id='message_list'（最精确）
+        2. class_name='ChatWnd'（QQ NT 消息区类名）
+        3. 通用 List control（兜底匹配）
+        4. 消息区坐标点击（40% 高度处，避开底部输入框）
+        全部层级使用 INFO 日志以便诊断。
+        """
+        ...
+    
+    def _retry_clipboard_copy(self, dlg):
+        """剪贴板重试：系统级 send_keys()（QQ NT Electron webview
+        仅响应系统级键盘事件，不响应窗口级 type_keys），
+        每次 Ctrl+C 后读剪贴板 3 次（应对剪贴板数据到达延迟），
+        递增退避重试，检查 shutdown_event 避免退出延迟。
+        """
+        ...
 ```
 
-**消息发送（模拟输入）：**
+**消息发送（剪贴板粘贴，确保中文可靠输入）：**
 ```python
     def send_to_contact(self, contact_name, message):
-        """发送消息给指定联系人（单人窗口）"""
+        """发送消息给指定联系人（剪贴板粘贴方案）"""
         hwnd = find_window_by_title(contact_name)
         if not hwnd:
             self._open_contact_via_main(contact_name)
@@ -312,25 +315,19 @@ class QQAutomation:
             raise Exception(f"无法打开联系人窗口: {contact_name}")
         activate_window(hwnd)
         dlg = self.app.window(handle=hwnd)
-        input_box = dlg.child_window(auto_id="input_edit", control_type="Edit")
-        input_box.click_input()
-        input_box.type_keys(message, with_spaces=True)
+        # 输入框定位：配置选择器 → 通用 Edit 控件 → 窗口底部点击
+        input_box = self._find_input_box(dlg)
+        if input_box is not None:
+            input_box.click_input()
+        else:
+            self._click_bottom(dlg)
+        # 剪贴板粘贴替代 type_keys，确保中文文本完整输入
+        self._paste_via_clipboard(message)
         send_keys('{ENTER}')
     
-    def _open_contact_via_main(self, contact_name):
-        """通过主窗口搜索框打开联系人（简化实现）"""
-        main_hwnd = find_window_by_title("QQ")
-        if not main_hwnd:
-            return
-        activate_window(main_hwnd)
-        dlg = self.app.window(handle=main_hwnd)
-        search_box = dlg.child_window(auto_id="search_box", control_type="Edit")
-        search_box.click_input()
-        search_box.type_keys(contact_name)
-        time.sleep(random.uniform(0.3, 0.6))
-        result_item = dlg.child_window(title=contact_name, control_type="ListItem")
-        if result_item.exists():
-            result_item.double_click_input()
+    def _find_input_box(self, dlg):
+        """输入框二级定位：配置 auto_id → 通用 Edit 控件（取最后一个）"""
+        ...
 ```
 
 #### 3.3 消息解析与指纹 (`message_parser.py`)
@@ -428,33 +425,45 @@ import time
 from collections import defaultdict
 
 class NotificationService:
-    def __init__(self, qq_auto, target_contact, cooldown_sec=30):
+    def __init__(self, qq_auto, target_contact, cooldown_sec=30, dry_run=False, dry_run_log_path=None):
         self.qq_auto = qq_auto
         self.target = target_contact
         self.cooldown = cooldown_sec
-        self.last_sent = defaultdict(float)  # key: (group, model) -> timestamp
+        self.dry_run = dry_run
+        self.dry_run_log_path = dry_run_log_path
+        self.last_sent = defaultdict(float)  # key: (group, model, sender) -> timestamp
     
     def send(self, group_name, message_obj, matched_models):
-        """发送通知：一条消息匹配多个型号时合并在一条通知中发送"""
+        """发送通知：一条消息匹配多个型号时合并在一条通知中发送。
+        
+        冷却键为 (群, 型号, 发送者) 三元组——不同发送者匹配同一型号
+        独立计时，不会互相屏蔽。
+        """
         if not matched_models:
-            return
-        # 按冷却过滤型号
+            return False
+        
+        sender = message_obj.get("sender", "")
         now = time.time()
         active_models = []
         for model in matched_models:
-            key = (group_name, model)
+            key = (group_name, model, sender)
             if now - self.last_sent.get(key, 0) >= self.cooldown:
                 active_models.append(model)
                 self.last_sent[key] = now
         if not active_models:
             return False  # 全部在冷却期内，跳过
-        # 合并为一条通知
+        
         models_str = "、".join(active_models)
         notification = (
             f"监控到{group_name}群里出现{models_str}信息："
             f"{message_obj['sender']}-{message_obj['time']}:\n"
             f"原文：{message_obj['content'][:100]}"
         )
+        
+        if self.dry_run:
+            self._write_dry_run(notification, group_name, active_models, message_obj)
+            return True
+        
         self.qq_auto.send_to_contact(self.target, notification)
         return True
 ```
@@ -480,12 +489,20 @@ def main():
     raw = re.sub(r'//.*', '', raw)            # 去除单行注释
     raw = re.sub(r'/\*.*?\*/', '', raw, flags=re.DOTALL)  # 去除块注释
     config = json.loads(raw)
-    logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
+    _setup_logging(config)  # 双通道日志：RotatingFileHandler(INFO+) + StreamHandler(WARNING+)
     
-    qq = QQAutomation()
+    # 全局关闭事件 (threading.Event)，信号处理器和主循环共享
+    _shutdown_event = threading.Event()
+    signal.signal(signal.SIGINT, lambda s, f: _shutdown_event.set())
+    signal.signal(signal.SIGTERM, lambda s, f: _shutdown_event.set())
+    
+    qq = QQAutomation(config, shutdown_event=_shutdown_event)
     tracker = IncrementalTracker()
-    matcher = ProductMatcher(config['product_csv_path'])
-    notifier = NotificationService(qq, config['target_contact'], config.get('cooldown_sec', 30))
+    matcher = ProductMatcher(config['product_csv_path'], case_sensitive=config.get('match_case_sensitive', False))
+    notifier = NotificationService(
+        qq, config['target_contact'], cooldown_sec=config.get('cooldown_sec', 30),
+        dry_run=args.dry_run, dry_run_log_path=dry_run_log,
+    )
     
     groups = config['groups']
     poll_interval = config.get('poll_interval_seconds', 60)
@@ -493,48 +510,24 @@ def main():
     logging.info(f"监控程序启动，监控群组：{groups}，型号数量：{len(matcher.models)}")
     
     cycle_count = 0
-    while True:
+    while not _shutdown_event.is_set():
         cycle_count += 1
         cycle_start = time.time()
-        cycle_stats = {"messages_total": 0, "messages_new": 0, "matches": 0, "notifications": 0, "skipped": 0}
+        cycle_stats = {...}  # 消息总数、新增、命中、通知、冷却跳过、窗口丢失、剪贴板空
+        
         for group in groups:
-            group_name = group['name']
-            try:
-                # 优先按群号匹配（更精确），降级按群名称匹配
-                hwnd = find_window_by_title(group['number']) or find_window_by_title(group['name'])
-                if not hwnd:
-                    logging.warning(f"未找到群窗口: {group['name']}({group['number']})")
-                    continue
-                raw_text = qq.copy_chat_content(hwnd)
-                if not raw_text:
-                    continue
-                all_msgs = parse_qq_messages(raw_text)
-                new_msgs = tracker.get_new_messages(group_name, all_msgs)
-                cycle_stats["messages_total"] += len(all_msgs)
-                cycle_stats["messages_new"] += len(new_msgs)
-                if new_msgs:
-                    logging.info(f"群 {group_name} 发现 {len(new_msgs)} 条新消息")
-                for msg in new_msgs:
-                    matched = matcher.match(msg['content'])
-                    if matched:
-                        logging.info(f"匹配成功 群:{group_name} 型号:{matched} 发送者:{msg['sender']} 内容:{truncate_message(msg['content'])}")
-                        sent = notifier.send(group_name, msg, matched)
-                        cycle_stats["matches"] += len(matched)
-                        cycle_stats["notifications"] += (1 if sent else 0)
-                time.sleep(random.uniform(0.5, 1.5))  # 群间随机间隔
-            except Exception as e:
-                logging.error(f"处理群 {group_name} 时出错: {e}", exc_info=True)
-        # 每10轮输出汇总指标
-        cycle_elapsed = time.time() - cycle_start
-        if cycle_count % 10 == 0:
-            logging.info(
-                f"[指标] 第{cycle_count}轮 | 总消息:{cycle_stats['messages_total']} "
-                f"新增:{cycle_stats['messages_new']} 命中:{cycle_stats['matches']} "
-                f"通知:{cycle_stats['notifications']} 耗时:{cycle_elapsed:.1f}s"
-            )
-        # 轮询间隔加入随机抖动(±10%)，避免固定周期被识别为机器人
-        jitter = poll_interval * random.uniform(-0.1, 0.1)
-        time.sleep(poll_interval + jitter)
+            if _shutdown_event.is_set():
+                break  # 群处理循环内响应关闭信号
+            # ... 窗口查找、消息采集、匹配、通知流程
+            # 群间间隔使用随机抖动（inter_group_delay_sec ±50%）
+        
+        # 每10轮输出汇总指标，含指纹缓存大小和各群耗时明细
+        
+        # 轮询间隔以 1 秒子等待方式实现，确保关闭延迟 ≤1 秒
+        sleep_remaining = poll_interval + jitter
+        while sleep_remaining > 0 and not _shutdown_event.is_set():
+            time.sleep(min(1.0, sleep_remaining))
+            sleep_remaining -= 1.0
 
 if __name__ == '__main__':
     main()
@@ -635,10 +628,30 @@ while True:
     "product_csv_path": "D:\\monitor\\products.csv",
     // 日志文件目录
     "log_dir": "D:\\monitor\\logs",
-    // 同型号同群通知冷却时间（秒），默认30
+    // 同型号同群同发送者通知冷却时间（秒），默认30。不同发送者独立计时
     "cooldown_sec": 30,
     // 型号匹配是否区分大小写，默认false（不区分）
-    "match_case_sensitive": false
+    "match_case_sensitive": false,
+    // 窗口/剪贴板操作重试次数
+    "retry_attempts": 3,
+    // 重试基础间隔（秒），实际使用递增退避
+    "retry_delay_sec": 1,
+    // 群间处理间隔（秒），使用随机抖动
+    "inter_group_delay_sec": 5,
+    // 单个日志文件最大字节数（10MB）
+    "log_max_bytes": 10485760,
+    // 保留的日志备份数量
+    "log_backup_count": 5,
+    // pywinauto 元素定位器，QQ 版本变化时调整此处即可
+    "ui_selectors": {
+        "main_window_title_pattern": "^QQ$",
+        "message_list": {"auto_id": "message_list", "control_type": "List"},
+        "message_area_fallback": {"class_name": "ChatWnd"},
+        "input_edit": {"auto_id": "input_edit", "control_type": "Edit"},
+        "search_box": {"auto_id": "search_box", "control_type": "Edit"},
+        "contact_result_item": {"title": null, "control_type": "ListItem"},
+        "fallback_to_center_click": true
+    }
 }
 ```
 
@@ -647,21 +660,25 @@ while True:
 | 异常场景 | 处理策略 |
 |----------|----------|
 | 群窗口找不到 | WARNING日志，跳过本次轮询，下次继续寻找（优先按群号匹配，降级按群名匹配） |
-| 剪贴板复制失败 | 重试3次（每次尝试前清空剪贴板），递增退避（0.5s→1.0s→1.5s）；仍失败则跳过该群 |
+| UIA消息列表元素缺失 | 自动回退到剪贴板方案（Ctrl+A/Ctrl+C），若剪贴板也失败则 WARNING 日志跳过该群 |
+| 剪贴板复制失败 | 每轮Ctrl+C后读剪贴板3次（应对延迟），重试3轮，递增退避；仍失败则跳过该群。使用系统级 send_keys()（QQ NT Electron webview 仅响应系统级键盘事件） |
 | 发送消息失败（联系人窗口丢失） | 尝试通过主窗口搜索重新打开联系人窗口；失败则ERROR日志，放弃本次通知 |
 | QQ进程崩溃 | 看门狗检测后重启QQ；QQ保存密码可自动登录；若30s内未检测到登录状态则记录ERROR并提醒运维人员 |
 | QQ自动登录失败 | 看门狗记录ERROR日志提醒运维人员手动登录；主程序继续运行等待窗口恢复 |
 | 程序主循环异常 | 捕获后记录ERROR，continue继续下一轮（不崩溃） |
 | 产品CSV加载失败 | Fatal级别，程序退出（型号列表是关键依赖） |
-| QQ连接失败（pywinauto UIA） | Fatal级别，程序退出（无法操作QQ） |
+| QQ连接失败（pywinauto UIA） | 三策略降级：精确标题→进程PID→title_re模式；全部失败则Fatal退出 |
+| 用户Ctrl+C中断 | threading.Event 信号机制，在剪贴板重试循环、群处理循环、轮询间隔中均可秒级响应 |
 
 ### 8. 测试与验证要点
 
 - 手动在群中发送包含型号的消息，检查60秒内是否收到通知。
-- 发送多条相同型号，确认30秒冷却期内不会重复通知。
+- 发送多条相同型号（同一发送者），确认30秒冷却期内不会重复通知。
+- 不同发送者同时发相同型号，确认各自均能收到通知（三元组冷却独立计时）。
 - 最小化所有群窗口到任务栏，程序应能正常激活。
 - 断开远程桌面后重连，检查程序是否继续运行（需正确配置组策略）。
 - 长时间运行72小时，观察内存和CPU占用。
+- `Ctrl+C` 中断后程序应在 1 秒内退出（无 22 秒延迟）。
 
 #### 8.1 演习模式（Dry-Run）
 

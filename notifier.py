@@ -59,7 +59,7 @@ class NotificationService:
 
         models_str = "、".join(active_models)
         notification = (
-            f"监控到{group_name}群里出现{models_str}信息："
+            f"{group_name}群里出现{models_str}信息："
             f"{message_obj['sender']}-{message_obj['time']}:\n"
             f"原文：{message_obj['content'][:100]}"
         )
