@@ -8,6 +8,7 @@ import random
 import re
 import signal
 import sys
+import threading
 import time
 from logging.handlers import RotatingFileHandler
 from pathlib import Path
@@ -21,14 +22,13 @@ from notifier import NotificationService
 
 logger = logging.getLogger(__name__)
 
-# Global shutdown flag, set by signal handlers.
-_shutdown_requested = False
+# Global shutdown event, set by signal handlers.
+_shutdown_event = threading.Event()
 
 
 def _handle_signal(signum: int, frame) -> None:
-    global _shutdown_requested
     logger.info("Received signal %d, shutting down gracefully...", signum)
-    _shutdown_requested = True
+    _shutdown_event.set()
 
 
 def _strip_jsonc_comments(raw: str) -> str:
@@ -128,7 +128,7 @@ def main():
 
     # --- init modules ---
     try:
-        qq = QQAutomation(config)
+        qq = QQAutomation(config, shutdown_event=_shutdown_event)
     except Exception:
         logger.fatal("QQ 连接失败，程序退出")
         sys.exit(1)
@@ -171,9 +171,8 @@ def main():
 
     # --- main loop ---
     cycle_count = 0
-    global _shutdown_requested
 
-    while not _shutdown_requested:
+    while not _shutdown_event.is_set():
         cycle_count += 1
         cycle_start = time.time()
         cycle_stats = {
@@ -188,6 +187,8 @@ def main():
         }
 
         for group in groups:
+            if _shutdown_event.is_set():
+                break
             gname = group.get("name", group.get("number", "?"))
             gnumber = group.get("number", "")
             t0 = time.time()
@@ -275,7 +276,7 @@ def main():
         # responsive shutdown.
         jitter = poll_interval * random.uniform(-0.1, 0.1)
         sleep_remaining = poll_interval + jitter
-        while sleep_remaining > 0 and not _shutdown_requested:
+        while sleep_remaining > 0 and not _shutdown_event.is_set():
             chunk = min(1.0, sleep_remaining)
             time.sleep(chunk)
             sleep_remaining -= chunk

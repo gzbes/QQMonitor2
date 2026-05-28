@@ -29,7 +29,7 @@ class NotificationService:
         self._cooldown = cooldown_sec
         self._dry_run = dry_run
         self._dry_run_path = Path(dry_run_log_path) if dry_run_log_path else None
-        self._last_sent: dict[tuple[str, str], float] = defaultdict(float)
+        self._last_sent: dict[tuple[str, str, str], float] = defaultdict(float)
 
         if self._dry_run:
             logger.info("[DRY-RUN] NotificationService initialized — no QQ messages will be sent")
@@ -45,10 +45,11 @@ class NotificationService:
         if not matched_models:
             return False
 
+        sender = message_obj.get("sender", "")
         now = time.time()
         active_models = []
         for model in matched_models:
-            key = (group_name, model)
+            key = (group_name, model, sender)
             if now - self._last_sent.get(key, 0) >= self._cooldown:
                 active_models.append(model)
                 self._last_sent[key] = now
